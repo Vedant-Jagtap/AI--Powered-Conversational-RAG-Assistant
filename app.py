@@ -182,13 +182,13 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.rerun()
 
-    # Export chat (sidebar) - always visible when there's conversation
+    # Export chat (sidebar)
+    st.divider()
+    st.markdown("**Export chat**")
     if st.session_state.chat_history:
         docx_bytes = build_chat_docx(st.session_state.chat_history)
         pdf_bytes = build_chat_pdf(st.session_state.chat_history)
 
-        st.divider()
-        st.markdown("**Export chat**")
         st.download_button(
             label="Download Word (.docx)",
             data=docx_bytes,
@@ -201,6 +201,8 @@ with st.sidebar:
             file_name="chat_export.pdf",
             mime="application/pdf",
         )
+    else:
+        st.info("Ask a question first to enable chat export.")
 
 
 # ---------------------------
@@ -278,11 +280,11 @@ for chat in st.session_state.chat_history:
         if chat.get("used_pdfs"):
             st.markdown("**📄 PDFs used:** " + ", ".join(sorted(chat["used_pdfs"])))
 
-if st.session_state.chat_history:
-    docx_bytes = build_chat_docx(st.session_state.chat_history)
-    pdf_bytes = build_chat_pdf(st.session_state.chat_history)
+with st.expander("Export Chat"):
+    if st.session_state.chat_history:
+        docx_bytes = build_chat_docx(st.session_state.chat_history)
+        pdf_bytes = build_chat_pdf(st.session_state.chat_history)
 
-    with st.expander("Export Chat"):
         col1, col2 = st.columns(2)
         col1.download_button(
             label="Download chat as Word (.docx)",
@@ -296,6 +298,8 @@ if st.session_state.chat_history:
             file_name="chat_export.pdf",
             mime="application/pdf"
         )
+    else:
+        st.info("Ask a question first to enable chat export.")
 
 
 # ---------------------------
