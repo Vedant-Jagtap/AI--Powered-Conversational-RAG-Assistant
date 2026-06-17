@@ -8,7 +8,7 @@ Built using **Python, Streamlit, LangChain, FAISS, HuggingFace Embeddings, and G
 
 ## 🚀 Live Demo
 
-**Deployment Link:** https://ai--powered-conversational-rag-assistant-577.streamlit.app/
+**Deployment Link:** https://pdf-conversational-rag-assistant-v2.streamlit.app/
 
 ## 📌 Features
 
