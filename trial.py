@@ -1,8 +1,14 @@
+import io
+import re
+from datetime import datetime
+
 import os
 import streamlit as st
 import google.generativeai as genai
 
 from dotenv import load_dotenv
+from docx import Document
+from fpdf import FPDF
 from pypdf import PdfReader
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,20 +22,55 @@ from langchain_community.vectorstores import FAISS
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+api_key = os.getenv("GOOGLE_API_KEY")
 
-if not GOOGLE_API_KEY:
-    st.error(
-        "⚠️ GOOGLE_API_KEY not found. Create a .env file in the project root "
-        "with the line: GOOGLE_API_KEY=your_key_here"
-    )
-    st.stop()
+if not api_key:
+    try:
+        api_key = st.secrets["GOOGLE_API_KEY"]
+    except Exception:
+        st.error("Google API Key not found.")
+        st.stop()
 
-genai.configure(api_key=GOOGLE_API_KEY)
+genai.configure(api_key=api_key)
+st.set_page_config(
+    page_title="AI Powered RAG Assistant",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-st.set_page_config(page_title="Multi-PDF RAG Assistant", page_icon="📄", layout="wide")
-st.title("📄 Multi-PDF Conversational RAG Assistant")
+# ---------------------------
+# Mobile-friendly sidebar hint
+# ---------------------------
+# Streamlit auto-collapses the sidebar on small screens, leaving only a
+# small ">" arrow at the top-left that most mobile users miss entirely.
+# This shows a visible banner pointing to it specifically on narrow
+# viewports (CSS media query), without affecting desktop at all.
 
+st.markdown("""
+<style>
+@media (max-width: 768px) {
+    .mobile-sidebar-hint {
+        display: block !important;
+        background-color: rgba(99, 110, 250, 0.15);
+        border: 1px solid rgba(99, 110, 250, 0.4);
+        border-radius: 10px;
+        padding: 10px 14px;
+        margin-bottom: 14px;
+        font-size: 0.9rem;
+    }
+}
+.mobile-sidebar-hint {
+    display: none;
+}
+</style>
+<div class="mobile-sidebar-hint">
+    📱 On mobile, tap the <b>&gt;</b> arrow in the top-left corner to open the
+    sidebar — that's where you upload PDFs, switch search mode, and export chat.
+</div>
+""", unsafe_allow_html=True)
+
+st.title("📄 PDF Conversational RAG Assistant")
 
 # ---------------------------
 # Session State Initialization
@@ -58,6 +99,144 @@ def load_embeddings():
     )
 
 
+def _strip_markdown(text):
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    return text
+
+
+def _add_bold_runs(paragraph, text):
+    parts = re.split(r"(\*\*[^*]+\*\*)", text)
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**"):
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+        else:
+            paragraph.add_run(part)
+
+
+def build_chat_docx(chat_history):
+    doc = Document()
+    doc.add_heading("Multi-PDF RAG Assistant Chat Export", level=1)
+    doc.add_paragraph(f"Exported on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    for idx, chat in enumerate(chat_history, 1):
+        doc.add_heading(f"Q{idx}: {chat['question']}", level=2)
+
+        for line in chat["answer"].splitlines():
+            if not line.strip():
+                continue
+            if line.startswith("### "):
+                doc.add_heading(line[4:].strip(), level=4)
+            elif line.startswith("## "):
+                doc.add_heading(line[3:].strip(), level=3)
+            elif line.startswith(("* ", "- ")):
+                _add_bold_runs(doc.add_paragraph(style="List Bullet"), line[2:].strip())
+            else:
+                _add_bold_runs(doc.add_paragraph(), line)
+
+        if chat.get("used_pdfs"):
+            note = doc.add_paragraph()
+            run = note.add_run("PDFs used: " + ", ".join(sorted(chat["used_pdfs"])))
+            run.italic = True
+
+        doc.add_paragraph("")
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def build_chat_pdf(chat_history):
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    def s(text):
+        return text.encode("latin-1", "replace").decode("latin-1")
+
+    pdf.set_font("Arial", "B", 16)
+    pdf.multi_cell(0, 10, s("Multi-PDF RAG Assistant Chat Export"))
+
+    pdf.set_font("Arial", "", 10)
+    pdf.multi_cell(
+        0,
+        8,
+        s(f"Exported on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    )
+
+    pdf.ln(5)
+
+    for idx, chat in enumerate(chat_history, 1):
+
+        pdf.set_font("Arial", "B", 12)
+        pdf.multi_cell(
+            0,
+            8,
+            s(f"Q{idx}: {chat['question']}")
+        )
+
+        pdf.set_font("Arial", "", 11)
+
+        for line in chat["answer"].splitlines():
+
+            clean_line = _strip_markdown(line.strip())
+
+            if clean_line:
+                pdf.multi_cell(
+                    0,
+                    8,
+                    s(clean_line)
+                )
+
+        if chat.get("used_pdfs"):
+
+            pdf.set_font("Arial", "I", 10)
+
+            pdf.multi_cell(
+                0,
+                8,
+                s(
+                    "PDFs used: "
+                    + ", ".join(sorted(chat["used_pdfs"]))
+                )
+            )
+
+        pdf.ln(3)
+
+    return bytes(pdf.output())
+
+
+def balanced_multi_pdf_search(vector_store, query, pdf_names, per_pdf_k=4, fetch_k=200):
+    """
+    Plain similarity_search_with_score(k=10) over a mixed-PDF index can
+    starve smaller or less-similar PDFs entirely, since all top-k slots
+    can be filled by chunks from just one or two documents. This runs a
+    filtered search per PDF and merges results, guaranteeing every
+    uploaded PDF gets a fair chance to contribute context.
+    """
+    all_results = []
+
+    for pdf_name in pdf_names:
+        try:
+            results = vector_store.similarity_search_with_score(
+                query,
+                k=per_pdf_k,
+                filter={"source": pdf_name},
+                fetch_k=fetch_k
+            )
+            all_results.extend(results)
+        except Exception:
+            continue
+
+    all_results.sort(key=lambda pair: pair[1])
+    return all_results
+
+
 # ---------------------------
 # Sidebar
 # ---------------------------
@@ -71,13 +250,12 @@ with st.sidebar:
         accept_multiple_files=True
     )
 
-    process_clicked = st.button("Process PDFs", type="primary")
-
-    st.divider()
+    process_clicked = st.button("Process PDFs", type="primary", use_container_width=True)
 
     search_mode = st.radio(
         "Search Mode",
-        ["Multi PDFs", "Single PDF"]
+        ["Multi PDFs", "Single PDF"],
+        horizontal=True
     )
 
     selected_pdf = None
@@ -87,11 +265,37 @@ with st.sidebar:
             list(st.session_state.pdf_summaries.keys())
         )
 
-    st.divider()
+    col1, col2 = st.columns(2)
 
-    if st.button("🗑️ Clear Chat History"):
-        st.session_state.chat_history = []
-        st.rerun()
+    with col1:
+        if st.button("🗑️ Clear chat", use_container_width=True):
+            st.session_state.chat_history = []
+            st.rerun()
+
+    if st.session_state.chat_history:
+        docx_bytes = build_chat_docx(st.session_state.chat_history)
+#       pdf_bytes = build_chat_pdf(st.session_state.chat_history)
+        
+        
+        with col2:
+            st.download_button(
+                "⬇️ Word",
+                data=docx_bytes,
+                file_name="chat_export.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
+
+ #       st.download_button(
+  #          "⬇️ PDF",
+   #         data=pdf_bytes,
+    #        file_name="chat_export.pdf",
+     #       mime="application/pdf",
+      #      use_container_width=True
+       # )
+    else:
+        with col2:
+            st.caption("Export after chatting")
 
 
 # ---------------------------
@@ -253,9 +457,15 @@ Content:
             context = ""
 
             if search_mode == "Multi PDFs":
-                docs = vector_store.similarity_search_with_score(
+                # Balanced per-PDF retrieval so every uploaded PDF gets a
+                # fair shot at contributing context, instead of one or two
+                # PDFs dominating the top-k results.
+                docs = balanced_multi_pdf_search(
+                    vector_store,
                     retrieval_query,
-                    k=10
+                    uploaded_pdf_names,
+                    per_pdf_k=4,
+                    fetch_k=200
                 )
             elif selected_pdf:
                 docs = vector_store.similarity_search_with_score(
@@ -359,17 +569,6 @@ Instructions:
 
                     if used_pdfs:
                         st.markdown("**📄 PDFs used:** " + ", ".join(sorted(used_pdfs)))
-
-                    if docs:
-                        with st.expander("Sources Used"):
-                            for i, (doc, score) in enumerate(docs):
-                                st.markdown(f"### Source {i+1}")
-                                st.markdown(f"📄 PDF: {doc.metadata['source']}")
-                                st.write(doc.page_content)
-                                st.write(f"Score: {score}")
-
-                    with st.expander("Retrieved Context"):
-                        st.write(context)
 
             except Exception as e:
                 st.error(f"Gemini Error: {str(e)}")
